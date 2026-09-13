@@ -166,6 +166,15 @@ def _attach_worker_metrics(
         result["worker"] = metrics
 
 
+def _error_message(exc: BaseException) -> str:
+    """任务级错误文案: enriched 发布类失败对用户是"稍后再试", 不透出原始异常。"""
+    from app.enriched_generation import EnrichedGenerationUnavailableError
+
+    if isinstance(exc, EnrichedGenerationUnavailableError):
+        return "指标数据正在发布更新，请稍后重试"
+    return str(exc)
+
+
 def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
     sampler = _PeakRssSampler()
     sampler.start()
@@ -182,6 +191,12 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
         data_dir = Path(task["data_dir"])
         store = DataStore(data_dir)
         repo = KlineRepository(store)
+        # 子进程不继承主进程的因子注册表; 自定义/复合因子 (uf_/cf_) 在任何
+        # 涉及因子物化的 worker 任务里都依赖注册表, 启动时从存储加载。
+        # 单个加载失败只跳过 (fail-open 跳过该因子), 与主进程启动行为一致。
+        from app.factors.store import load_into_registry
+
+        load_into_registry(data_dir)
         strategy_engine = StrategyEngine(
             strategy_dirs=_strategy_dirs(data_dir),
             override_loader=lambda sid: strategy_config.load_override(data_dir, sid),
@@ -250,16 +265,17 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
             sampler.stop()
         event_queue.put({
             "type": "error",
-            "message": str(exc),
+            "message": _error_message(exc),
             "traceback": traceback.format_exc(),
         })
     finally:
         if store is not None:
             with suppress(Exception):
                 store.db.close()
-        # 终态消息已入队: 显式冲刷队列后立即退出。大数据量任务跳过解释器
-        # teardown (GC、DuckDB 线程 join、DLL 卸载), 否则收尾可达数十秒,
-        # 会撞上父进程 10s 退出预算。close+join_thread 保证消息完整落管。
+        # 终态消息已入队: 显式冲刷队列后立即退出。put 只是入队, 实际写管道的
+        # 是后台 feeder 线程, close+join_thread 保证消息完整落管 (否则父进程误判
+        # "exited without result"); 大数据量任务再跳过解释器 teardown (GC、DuckDB
+        # 线程 join、DLL 卸载), 否则收尾可达数十秒, 撞上父进程 10s 退出预算。
         with suppress(Exception):
             event_queue.close()
             event_queue.join_thread()
@@ -319,6 +335,21 @@ def run_worker_task(
                 result = message["payload"]
             elif message_type == "error":
                 failure = message
+
+        # 子进程退出后, 队列读线程可能尚未把管道尾部的 result/error 搬进本地缓冲
+        # (0.1s 轮询在系统高负载下会先看到 Empty+进程已死)。join 后做一次兜底排空,
+        # 只要消息完整刷入过管道就一定能取到。
+        if result is None and failure is None:
+            for _ in range(2):
+                try:
+                    message = events.get(timeout=1.0)
+                except queue.Empty:
+                    break
+                message_type = message.get("type")
+                if message_type == "result":
+                    result = message["payload"]
+                elif message_type == "error":
+                    failure = message
 
         process.join(timeout=10.0)
         worker_exit_forcibly = False

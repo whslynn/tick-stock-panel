@@ -30,7 +30,8 @@ interface Props {
   showAvgLine?: boolean
 }
 
-function fmtAmt(v: number): string {
+function fmtAmt(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return '—'
   if (v >= 1_000_000_000) return `${(v / 1_000_000_000).toFixed(2)}亿`
   if (v >= 10_000) return `${(v / 10_000).toFixed(0)}万`
   return v.toFixed(0)
@@ -62,7 +63,7 @@ function getLimitPrices(prevClose: number, priceLimit?: PriceLimitInfo): {
   return { limitUp, limitDown, upPct, downPct }
 }
 
-function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgPrices: number[], lineColor: string, areaColor: string, yMode: YMode, ct: ChartTheme, priceLimit?: PriceLimitInfo, showLimitLines = true, showAvgLine = true, priceLines: Props['priceLines'] = []): EChartsOption {
+function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgPrices: (number | null)[], lineColor: string, areaColor: string, yMode: YMode, ct: ChartTheme, priceLimit?: PriceLimitInfo, showLimitLines = true, showAvgLine = true, priceLines: Props['priceLines'] = []): EChartsOption {
   // 将数据映射到全天时间轴上的正确位置
   const timeIndexMap = new Map(FULL_DAY_TIMES.map((t, i) => [t, i]))
   const closes = new Array(FULL_DAY_TIMES.length).fill(null) as (number | null)[]
@@ -72,6 +73,9 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
   const volumes = new Array(FULL_DAY_TIMES.length).fill(null) as (any | null)[]
 
   const volNeutral = 'rgba(161,161,170,0.5)'
+  // 量柱着色基准: 前一分钟 close; 第一根用昨收。
+  // 不用 row.open — stock-sdk 历史日无真实分钟 open(为 null), close-vs-open 会全偏。
+  let prevRef: number | null = prevClose ?? null
   for (let i = 0; i < data.length; i++) {
     const timeKey = formatMinuteTime(data[i].datetime)
     const idx = timeIndexMap.get(timeKey)
@@ -83,9 +87,16 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
       volumes[idx] = {
         value: data[i].volume,
         itemStyle: {
-          color: data[i].close > data[i].open ? THEME.volUp : data[i].close < data[i].open ? THEME.volDown : volNeutral,
+          color: prevRef == null
+            ? volNeutral
+            : data[i].close > prevRef
+              ? THEME.volUp
+              : data[i].close < prevRef
+                ? THEME.volDown
+                : volNeutral,
         },
       }
+      prevRef = data[i].close
     }
   }
 
@@ -570,7 +581,7 @@ export function EChartsIntraday({
             <>
               {date && <span className="text-muted">{date}</span>}
               <span className="text-muted">开</span>
-              <span style={{ color: priceClr }}>{d.open.toFixed(2)}</span>
+              <span style={{ color: priceClr }}>{d.open != null ? d.open.toFixed(2) : '—'}</span>
               <span className="text-muted">高</span>
               <span style={{ color: priceClr }}>{d.high.toFixed(2)}</span>
               <span className="text-muted">低</span>
@@ -590,7 +601,7 @@ export function EChartsIntraday({
               </span>
               {showAvgLine && <span className="flex items-center gap-x-1">
                 <span style={{ display: 'inline-block', width: 14, height: 2, background: THEME.avgLine }} />
-                <span style={{ color: THEME.avgLine }}>{avg?.toFixed(2)}</span>
+                <span style={{ color: THEME.avgLine }}>{avg != null ? avg.toFixed(2) : '—'}</span>
               </span>}
               <span className="text-muted">量</span>
               <span className="text-secondary">{d.volume.toFixed(0)}</span>

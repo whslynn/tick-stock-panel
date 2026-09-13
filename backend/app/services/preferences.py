@@ -9,6 +9,7 @@ import copy
 import json
 import logging
 import re
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -54,25 +55,27 @@ def load() -> dict:
     return copy.deepcopy(_cache)
 
 
+_SAVE_LOCK = threading.Lock()
+
+
 def save(updates: dict) -> dict:
-    """合并写入。返回新内容。"""
-    current = load()
-    current.update(updates)
-    _path().write_text(
-        json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
-    _invalidate_cache()
+    """合并写入。返回新内容。
+
+    锁内 read-modify-write: FastAPI 同步端点跑线程池, 并行 PUT 各自基于旧快照
+    写盘会互相覆盖 (实测: 压缩总开关并行写分时/日K两键, 后写者把先写者覆盖)。
+    """
+    with _SAVE_LOCK:
+        current = load()
+        current.update(updates)
+        _path().write_text(
+            json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8",
+        )
+        _invalidate_cache()
     return current
 
 
 def get_realtime_quotes_enabled() -> bool:
     return load().get("realtime_quotes_enabled", False)
-
-
-def get_indices_nav_pinned() -> bool:
-    """侧栏指数报价卡片是否固定显示。默认 True（常驻）。
-    关闭后，卡片跟随实时行情开关（仅实时开时显示）。"""
-    return load().get("indices_nav_pinned", True)
 
 
 def get_watchlist_groups_in_nav() -> bool:
@@ -84,37 +87,13 @@ def get_realtime_quote_interval() -> float:
     return load().get("realtime_quote_interval", 6.0)
 
 
-def get_realtime_watchlist_symbols() -> list[str]:
-    """Free 档自选实时监控标的:直接取自选页前 5 个。"""
-    try:
-        from app.services import watchlist
-        rows = watchlist.list_symbols()
-    except Exception as e:  # noqa: BLE001
-        logger.warning("load watchlist for realtime failed: %s", e)
-        return []
-    out: list[str] = []
-    for row in rows:
-        symbol = str((row or {}).get("symbol") or "").strip().upper()
-        if symbol and symbol not in out:
-            out.append(symbol)
-        if len(out) >= 5:
-            break
-    return out
-
-
-def set_realtime_watchlist_symbols(symbols: list[str]) -> list[str]:  # noqa: ARG001
-    """兼容旧接口: Free 实时标的现在由自选页前 5 个决定。"""
-    return get_realtime_watchlist_symbols()
-
-
 def set_realtime_quote_interval(interval: float) -> float:
-    """保存行情轮询间隔（不在此做 min/max 校验，由调用方按档位限制）。"""
-    current = load()
-    current["realtime_quote_interval"] = interval
-    _path().write_text(
-        json.dumps(current, indent=2, ensure_ascii=False), encoding="utf-8",
-    )
-    _invalidate_cache()
+    """保存行情轮询间隔（不在此做 min/max 校验，由调用方按档位限制）。
+
+    走 save() 而不是自己 load + write_text: 锁外的 read-modify-write 会用旧快照
+    整体覆盖文件, 把并发写入的另一个偏好丢掉 (见 save 的 docstring)。
+    """
+    save({"realtime_quote_interval": interval})
     return interval
 
 
@@ -214,6 +193,27 @@ def get_minute_sync_segment_days() -> int:
     """
     return max(5, min(30, load().get("minute_sync_segment_days", 20)))
 
+# ===== 盘中分钟增量刷新 (Expert 专有) =====
+
+# 稳态轮为 intraday.universe 单请求增量, 无脉冲并发, 间隔可低至 3s;
+# 全天修复轮 (intraday.batch 28 块爆发) 的 rpm 安全与间隔无关, 由轮次
+# 调度 max(间隔, 单轮完成) 天然防重叠。
+_MINUTE_REFRESH_INTERVAL_MIN = 3
+_MINUTE_REFRESH_INTERVAL_MAX = 120
+
+
+def get_minute_refresh_enabled() -> bool:
+    """盘中分钟K增量落盘开关。默认关闭; 能力门控 (Expert) 在服务层判断。"""
+    return bool(load().get("minute_refresh_enabled", False))
+
+
+def get_minute_refresh_interval() -> int:
+    """盘中分钟增量刷新间隔(秒)。默认 6,范围 [3, 120]。"""
+    return max(
+        _MINUTE_REFRESH_INTERVAL_MIN,
+        min(_MINUTE_REFRESH_INTERVAL_MAX, int(load().get("minute_refresh_interval", 6))),
+    )
+
 
 # ===== 数据源选择 (默认 TickFlow；第一阶段仅日K切换入口) =====
 
@@ -246,6 +246,20 @@ def get_data_source_long_job_timeout_s() -> int:
     return max(DATA_SOURCE_JOB_TIMEOUT_MIN_S, timeout_s)
 
 
+def get_minute_batch_compress() -> bool:
+    """分时详情与批量响应是否启用 gzip 传输压缩。默认开启 (公网部署传输是大头);
+    本机/内网可关闭省服务端 CPU。每次请求即时读取, 开关保存后立即生效。
+    """
+    raw = load().get("minute_batch_compress", True)
+    return bool(raw)
+
+
+def get_daily_batch_compress() -> bool:
+    """日K详情与批量响应是否启用 gzip 传输压缩 (与分时各自独立配置)。默认开启。"""
+    raw = load().get("daily_batch_compress", True)
+    return bool(raw)
+
+
 def _allowed_data_providers() -> set[str]:
     try:
         from app.data_providers import custom as custom_sources
@@ -260,14 +274,23 @@ def get_daily_data_provider() -> str:
 
 
 def get_adj_factor_provider() -> str:
-    provider = str(load().get("adj_factor_provider", "same_as_daily") or "same_as_daily").lower()
-    if provider == "same_as_daily":
-        return provider
-    return provider if provider in _allowed_data_providers() else "same_as_daily"
+    # 「跟随日K」(same_as_daily) 特殊值已下线: 存量配置里的旧值按非法值回退 tickflow
+    provider = str(load().get("adj_factor_provider", "tickflow") or "tickflow").lower()
+    return provider if provider in _allowed_data_providers() else "tickflow"
 
 
 def get_minute_data_provider() -> str:
     provider = str(load().get("minute_data_provider", "tickflow") or "tickflow").lower()
+    return provider if provider in _allowed_data_providers() else "tickflow"
+
+
+def get_full_minute_data_provider() -> str:
+    provider = str(load().get("full_minute_data_provider", "tickflow") or "tickflow").lower()
+    return provider if provider in _allowed_data_providers() else "tickflow"
+
+
+def get_depth5_data_provider() -> str:
+    provider = str(load().get("depth5_data_provider", "tickflow") or "tickflow").lower()
     return provider if provider in _allowed_data_providers() else "tickflow"
 
 
@@ -284,8 +307,8 @@ def get_financial_provider() -> str:
 # ===== 盘后管道拉取内容开关 (A股 / ETF / 指数 独立控制) =====
 
 def get_pipeline_pull_a_share() -> bool:
-    """A 股日K固定拉取。"""
-    return True
+    """是否拉取 A 股日K。默认 True。"""
+    return load().get("pipeline_pull_a_share", True)
 
 
 def get_pipeline_pull_etf() -> bool:
@@ -429,7 +452,7 @@ def set_mainline_filter_config(cfg: dict) -> dict:
     return get_mainline_filter_config()
 
 
-_PIPELINE_PULL_KEYS = ("pipeline_pull_etf", "pipeline_pull_index")
+_PIPELINE_PULL_KEYS = ("pipeline_pull_a_share", "pipeline_pull_etf", "pipeline_pull_index")
 
 
 def get_pipeline_pull_types() -> dict:
@@ -463,17 +486,23 @@ def set_pipeline_index_symbols(symbols: str) -> str:
 
 
 def get_pipeline_schedule() -> dict:
-    """返回盘后管道调度时间 {"hour": 15, "minute": 30}。"""
-    d = load().get("pipeline_schedule", {"hour": 15, "minute": 30})
-    return {"hour": d.get("hour", 15), "minute": d.get("minute", 30)}
+    """返回盘后管道调度时间 {"hour": 15, "minute": 35}。
+
+    默认 15:35 而非 15:30 整: 盘后固定价交易 15:30 才彻底结束, 且供应商
+    聚合含盘后量的官方日K需要时间 —— 整点即拉可能写入不含盘后成交的
+    日线, 也与 quote 定版重试窗口终点 (15:30) 精确重合。留 5 分钟缓冲。
+    """
+    d = load().get("pipeline_schedule", {"hour": 15, "minute": 35})
+    return {"hour": d.get("hour", 15), "minute": d.get("minute", 35)}
 
 
 def set_pipeline_schedule(hour: int, minute: int) -> dict:
     h = max(0, min(23, hour))
     m = max(0, min(59, minute))
-    # 盘后不早于 15:00
-    if h * 60 + m < 15 * 60:
-        h, m = 15, 0
+    # 盘后管道不早于 15:35: 15:30 盘后固定价才终止 (量/额此前仍会变),
+    # 且供应商官方日线定稿需要缓冲 —— 更早启动可能固化不含盘后量的当日分区
+    if h * 60 + m < 15 * 60 + 35:
+        h, m = 15, 35
     save({"pipeline_schedule": {"hour": h, "minute": m}})
     return {"hour": h, "minute": m}
 
@@ -556,21 +585,23 @@ def set_depth_finalize_time(hour: int, minute: int) -> dict:
     return {"hour": h, "minute": m}
 
 
-# 复盘推送可选渠道白名单 (企业微信已实现, 与飞书并列)
+# 监控与复盘共用的外部推送渠道白名单。
 # 多选: 不推送 = 空数组, 而非 'none'
-REVIEW_PUSH_CHANNELS = {"feishu", "wecom"}
+PUSH_CHANNELS = {"feishu", "wecom", "custom", "email"}
 
 
 def get_review_schedule() -> dict:
-    """定时复盘调度 {"enabled": False, "hour": 15, "minute": 10}。默认关闭。
+    """定时复盘调度 {"enabled": False, "hour": 15, "minute": 40}。默认关闭。
 
-    A股 15:00 收盘, 默认时间设为 15:10(收盘后即时复盘), 强制下限 15:00。
+    默认 15:40: 盘后管道默认 15:35 启动, 留 5 分钟缓冲, 复盘使用管道
+    产出的最终口径数据 (含盘后量校正的日K/enriched)。强制下限 15:00 —
+    偏好收盘后即时复盘 (走实时快照缓存, 不等管道) 的用户可自行调早。
     """
-    d = load().get("review_schedule", {"enabled": False, "hour": 15, "minute": 10})
+    d = load().get("review_schedule", {"enabled": False, "hour": 15, "minute": 40})
     return {
         "enabled": bool(d.get("enabled", False)),
         "hour": d.get("hour", 15),
-        "minute": d.get("minute", 10),
+        "minute": d.get("minute", 40),
     }
 
 
@@ -638,7 +669,7 @@ def get_review_push_channels() -> list[str]:
     d = load()
     raw = d.get("review_push_channels")
     if isinstance(raw, list):
-        return [c for c in raw if c in REVIEW_PUSH_CHANNELS]
+        return [c for c in raw if c in PUSH_CHANNELS]
     # 兼容老单选字符串
     if d.get("review_push_channel") == "feishu":
         return ["feishu"]
@@ -653,11 +684,31 @@ def set_review_push_channels(channels: list[str]) -> list[str]:
     seen: set[str] = set()
     cleaned: list[str] = []
     for c in channels or []:
-        if c in REVIEW_PUSH_CHANNELS and c not in seen:
+        if c in PUSH_CHANNELS and c not in seen:
             seen.add(c)
             cleaned.append(c)
     save({"review_push_channels": cleaned})
     return cleaned
+
+
+REVIEW_PUSH_MODES = frozenset({"auto", "manual"})
+
+
+def get_review_push_mode() -> str:
+    """复盘推送触发方式: auto=归档后自动推; manual=仅显式 push。默认 manual。
+
+    定时复盘与手动保存复盘共用此开关。manual 时定时路径只归档不推送,
+    手动路径需 save_report 显式传 push=True 才推。
+    """
+    mode = load().get("review_push_mode", "manual")
+    return mode if mode in REVIEW_PUSH_MODES else "manual"
+
+
+def set_review_push_mode(mode: str) -> str:
+    """保存复盘推送触发方式, 白名单外的值回退 manual。"""
+    mode = mode if mode in REVIEW_PUSH_MODES else "manual"
+    save({"review_push_mode": mode})
+    return mode
 
 
 
@@ -670,10 +721,9 @@ SSE_REFRESH_PAGES_DEFAULT = {
     "limit-ladder": False,
 }
 
-SIDEBAR_INDEX_SYMBOLS_DEFAULT = ["000001.SH", "399001.SZ", "399006.SZ", "000680.SH"]
-
 
 # ===== 盘中实时行情范围 (独立于盘后管道范围) =====
+# 指数不在其中: 展示层固定核心四只 (app.services.index_const), 不开放配置。
 
 
 def get_realtime_pull_stock() -> bool:
@@ -685,32 +735,11 @@ def get_realtime_pull_etf() -> bool:
     return load().get("realtime_pull_etf", False)
 
 
-def get_realtime_pull_index() -> bool:
-    return load().get("realtime_pull_index", True)
-
-
-def get_realtime_index_mode() -> str:
-    mode = str(load().get("realtime_index_mode", "core") or "core").lower()
-    return mode if mode in {"core", "all"} else "core"
-
-
-def get_realtime_index_symbols() -> list[str]:
-    stored = load().get("realtime_index_symbols", SIDEBAR_INDEX_SYMBOLS_DEFAULT)
-    if isinstance(stored, str):
-        import re
-        stored = [s.strip() for s in re.split(r"[,\s]+", stored) if s.strip()]
-    return [str(s) for s in stored if str(s).strip()]
-
-
 def set_realtime_quote_scope(cfg: dict) -> dict:
     updates = {}
-    for key in ("realtime_pull_stock", "realtime_pull_etf", "realtime_pull_index"):
+    for key in ("realtime_pull_stock", "realtime_pull_etf"):
         if key in cfg and cfg[key] is not None:
             updates[key] = bool(cfg[key])
-    if "realtime_index_mode" in cfg and cfg["realtime_index_mode"] in {"core", "all"}:
-        updates["realtime_index_mode"] = cfg["realtime_index_mode"]
-    if "realtime_index_symbols" in cfg and cfg["realtime_index_symbols"] is not None:
-        updates["realtime_index_symbols"] = cfg["realtime_index_symbols"]
     if updates:
         save(updates)
     return get_realtime_quote_scope()
@@ -720,9 +749,6 @@ def get_realtime_quote_scope() -> dict:
     return {
         "realtime_pull_stock": get_realtime_pull_stock(),
         "realtime_pull_etf": get_realtime_pull_etf(),
-        "realtime_pull_index": get_realtime_pull_index(),
-        "realtime_index_mode": get_realtime_index_mode(),
-        "realtime_index_symbols": get_realtime_index_symbols(),
     }
 
 
@@ -739,13 +765,6 @@ def set_sse_refresh_pages(pages: dict[str, bool]) -> dict[str, bool]:
     """保存页面 SSE 刷新配置。"""
     save({"sse_refresh_pages": pages})
     return get_sse_refresh_pages()
-
-
-def get_sidebar_index_symbols() -> list[str]:
-    """返回左侧菜单显示的指数代码。"""
-    stored = load().get("sidebar_index_symbols", SIDEBAR_INDEX_SYMBOLS_DEFAULT)
-    allowed = set(SIDEBAR_INDEX_SYMBOLS_DEFAULT)
-    return [s for s in stored if s in allowed]
 
 
 def get_strategy_monitor_enabled() -> bool:
@@ -803,6 +822,71 @@ def set_wecom_webhook_url(url: str) -> str:
     from app.services.webhook_adapter import normalize_wecom_url
     save({"wecom_webhook_url": normalize_wecom_url(url)})
     return get_wecom_webhook_url()
+
+
+def get_custom_webhook_url() -> str:
+    """Generic third-party JSON Webhook URL shared by enabled rules and reviews."""
+    return str(load().get("custom_webhook_url") or "")
+
+
+def set_custom_webhook_url(url: str) -> str:
+    """Persist or clear the generic third-party JSON Webhook URL."""
+    value = str(url or "").strip()
+    save({"custom_webhook_url": value})
+    return value
+
+
+_EMAIL_SMTP_DEFAULTS = {
+    "host": "",
+    "port": 465,
+    "security": "ssl",
+    "username": "",
+    "from_address": "",
+    "to_addresses": [],
+}
+
+
+def get_email_smtp_config() -> dict:
+    """Return non-secret SMTP settings for the email notification channel."""
+    raw = load().get("email_smtp_config")
+    if not isinstance(raw, dict):
+        raw = {}
+    security = raw.get("security", _EMAIL_SMTP_DEFAULTS["security"])
+    if security not in {"ssl", "starttls", "none"}:
+        security = _EMAIL_SMTP_DEFAULTS["security"]
+    try:
+        port = int(raw.get("port", _EMAIL_SMTP_DEFAULTS["port"]))
+    except (TypeError, ValueError):
+        port = _EMAIL_SMTP_DEFAULTS["port"]
+    if not 1 <= port <= 65535:
+        port = _EMAIL_SMTP_DEFAULTS["port"]
+    recipients = raw.get("to_addresses")
+    if not isinstance(recipients, list):
+        recipients = []
+    return {
+        "host": str(raw.get("host") or "").strip(),
+        "port": port,
+        "security": security,
+        "username": str(raw.get("username") or "").strip(),
+        "from_address": str(raw.get("from_address") or "").strip(),
+        "to_addresses": [str(item).strip() for item in recipients if str(item).strip()],
+    }
+
+
+def set_email_smtp_config(config: dict) -> dict:
+    """Atomically persist the non-secret SMTP configuration group."""
+    normalized = {
+        "host": str(config.get("host") or "").strip(),
+        "port": int(config.get("port", 465)),
+        "security": str(config.get("security") or "ssl"),
+        "username": str(config.get("username") or "").strip(),
+        "from_address": str(config.get("from_address") or "").strip(),
+        "to_addresses": [
+            str(item).strip() for item in config.get("to_addresses", []) if str(item).strip()
+        ],
+    }
+    save({"email_smtp_config": normalized})
+    return get_email_smtp_config()
 
 
 # ===== 企业微信智能机器人 (API 模式 / 长连接) =====
@@ -871,7 +955,7 @@ def get_webhook_default_channels() -> list[str]:
     d = load()
     raw = d.get("webhook_default_channels")
     if isinstance(raw, list):
-        return [c for c in raw if c in REVIEW_PUSH_CHANNELS]
+        return [c for c in raw if c in PUSH_CHANNELS]
     # 兼容老布尔开关 (勾选即双推)
     if d.get("webhook_enabled_default") is True:
         return ["feishu", "wecom"]
@@ -883,7 +967,7 @@ def set_webhook_default_channels(channels: list[str]) -> list[str]:
     seen: set[str] = set()
     cleaned: list[str] = []
     for c in channels or []:
-        if c in REVIEW_PUSH_CHANNELS and c not in seen:
+        if c in PUSH_CHANNELS and c not in seen:
             seen.add(c)
             cleaned.append(c)
     save({"webhook_default_channels": cleaned})
@@ -909,9 +993,6 @@ def set_realtime_monitor_config(cfg: dict) -> dict:
         updates["strategy_monitor_enabled"] = cfg["strategy_monitor_enabled"]
     if "strategy_monitor_ids" in cfg:
         updates["strategy_monitor_ids"] = cfg["strategy_monitor_ids"]
-    if "sidebar_index_symbols" in cfg:
-        allowed = set(SIDEBAR_INDEX_SYMBOLS_DEFAULT)
-        updates["sidebar_index_symbols"] = [s for s in cfg["sidebar_index_symbols"] if s in allowed]
     if "screener_auto_run" in cfg:
         updates["screener_auto_run"] = bool(cfg["screener_auto_run"])
     if "minute_intraday_refresh" in cfg:
@@ -921,6 +1002,13 @@ def set_realtime_monitor_config(cfg: dict) -> dict:
         updates["minute_intraday_refresh_interval"] = max(
             _INTRADAY_REFRESH_INTERVAL_MIN,
             min(_INTRADAY_REFRESH_INTERVAL_MAX, int(cfg["minute_intraday_refresh_interval"])))
+    if "minute_refresh_enabled" in cfg:
+        updates["minute_refresh_enabled"] = bool(cfg["minute_refresh_enabled"])
+    if "minute_refresh_interval" in cfg:
+        # clamp 到 [3, 120], 与 getter 一致, 防前端传越界值
+        updates["minute_refresh_interval"] = max(
+            _MINUTE_REFRESH_INTERVAL_MIN,
+            min(_MINUTE_REFRESH_INTERVAL_MAX, int(cfg["minute_refresh_interval"])))
     if "monitor_ext_fields" in cfg:
         raw = cfg["monitor_ext_fields"] or {}
         updates["monitor_ext_fields"] = {
@@ -938,10 +1026,11 @@ def get_realtime_monitor_config() -> dict:
         "sse_refresh_pages": get_sse_refresh_pages(),
         "strategy_monitor_enabled": get_strategy_monitor_enabled(),
         "strategy_monitor_ids": get_strategy_monitor_ids(),
-        "sidebar_index_symbols": get_sidebar_index_symbols(),
         "screener_auto_run": get_screener_auto_run(),
         "minute_intraday_refresh": get_minute_intraday_refresh(),
         "minute_intraday_refresh_interval": get_minute_intraday_refresh_interval(),
+        "minute_refresh_enabled": get_minute_refresh_enabled(),
+        "minute_refresh_interval": get_minute_refresh_interval(),
         "monitor_ext_fields": get_monitor_ext_fields(),
     }
 

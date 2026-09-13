@@ -128,9 +128,9 @@ class FactorColumnsResponse(BaseModel):
 
 @router.get("/factor/columns")
 def factor_columns():
-    """返回可用的因子列列表。"""
-    from app.backtest.factor import FACTOR_COLUMNS
-    return {"columns": FACTOR_COLUMNS}
+    """返回可用的因子列列表 (含运行期注册的自定义/复合因子)。"""
+    from app.factors.registry import factor_columns_view
+    return {"columns": factor_columns_view()}
 
 
 class FactorBacktestRequest(BaseModel):
@@ -149,16 +149,17 @@ class FactorBacktestRequest(BaseModel):
 @router.post("/factor/run")
 def factor_run(req: FactorBacktestRequest, request: Request):
     """因子回测 — IC/IR 分析 + 分层回测。"""
-    from app.backtest.factor import FACTOR_COLUMNS, FactorBacktestService, FactorConfig
+    from app.backtest.factor import FactorBacktestService, FactorConfig
+    from app.factors.registry import factor_columns_view
 
-    if req.factor_name not in {item["id"] for item in FACTOR_COLUMNS}:
+    if req.factor_name not in {item["id"] for item in factor_columns_view()}:
         raise HTTPException(status_code=400, detail=f"不支持的因子: {req.factor_name}")
 
     engine = _get_engine(request)
     svc = FactorBacktestService(engine)
 
     end = req.end or date.today()
-    start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)
+    start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
     symbols = req.symbols if req.symbols else None
     if symbols is not None and len(symbols) > FACTOR_MAX_SYMBOLS:
@@ -184,7 +185,7 @@ def factor_run(req: FactorBacktestRequest, request: Request):
 
 
 class FactorBatchRequest(BaseModel):
-    factor_names: list[str] = Field(..., min_length=1, max_length=64)
+    factor_names: list[str] = Field(..., min_length=1, max_length=96)  # 目录 77 + 自定义余量
     symbols: list[str] | None = None
     start: date | None = None
     end: date | None = None
@@ -200,19 +201,19 @@ class FactorBatchRequest(BaseModel):
 def factor_batch(req: FactorBatchRequest, request: Request):
     """批量筛选因子, 同一批次只加载并计算一次数据面板。"""
     from app.backtest.factor import (
-        FACTOR_COLUMNS,
         FactorBacktestService,
         FactorBatchConfig,
     )
+    from app.factors.registry import factor_columns_view
 
     factor_names = list(dict.fromkeys(req.factor_names))
-    allowed = {item["id"] for item in FACTOR_COLUMNS}
+    allowed = {item["id"] for item in factor_columns_view()}
     invalid = [name for name in factor_names if name not in allowed]
     if invalid:
         raise HTTPException(status_code=400, detail=f"不支持的因子: {', '.join(invalid)}")
 
     end = req.end or date.today()
-    start = _resolve_start(req, end, STRATEGY_DEFAULT_DAYS)
+    start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
     symbols = req.symbols if req.symbols else None
     if symbols is not None and len(symbols) > FACTOR_MAX_SYMBOLS:
@@ -346,6 +347,33 @@ class StrategyBacktestRequest(BaseModel):
     regime_filter: dict | None = None
 
 
+def _guard_minute_strategy_backtest(
+    request: Request, strategy_id: str, start: date, asset_type: str,
+) -> None:
+    """分钟策略回测入口守卫: 仅 A 股 + 本地分钟K覆盖检查 (fail-fast)。"""
+    engine = getattr(request.app.state, "strategy_engine", None)
+    if engine is None:
+        return
+    try:
+        s = engine.get(strategy_id)
+    except ValueError:
+        return
+    if s is None or s.execution_backend != "minute_filter":
+        return
+    if asset_type != "stock":
+        raise HTTPException(400, detail="分钟策略回测当前仅支持 A 股 (stock)")
+    earliest = request.app.state.repo.earliest_minute_date()
+    if earliest is None or start < earliest:
+        have = f"最早到 {earliest}, " if earliest else ""
+        raise HTTPException(
+            400,
+            detail=(
+                f"本地分钟K{have}无法覆盖回测起始日 {start}。"
+                "请先用「扩展分钟K历史」拉取更多数据, 或缩小回测区间"
+            ),
+        )
+
+
 @router.post("/strategy/run")
 def strategy_run(req: StrategyBacktestRequest, request: Request):
     """策略回测 — 复用 StrategyDef 体系做全周期回测。"""
@@ -355,6 +383,7 @@ def strategy_run(req: StrategyBacktestRequest, request: Request):
     end = req.end or date.today()
     start = _resolve_start(req, end, FACTOR_DEFAULT_DAYS)
     _guard_server_backtest_range(start, end)
+    _guard_minute_strategy_backtest(request, req.strategy_id, start, req.asset_type)
 
     cfg = StrategyBacktestConfig(
         strategy_id=req.strategy_id,
@@ -498,13 +527,16 @@ async def strategy_stream(
     from app.backtest.strategy import StrategyBacktestConfig
     from app.backtest.worker import make_worker_task, run_worker_task
 
-    end_date = date.fromisoformat(end) if end else date.today()
-    if start:
-        start_date = date.fromisoformat(start)
-    else:
+    try:
+        end_date = date.fromisoformat(end) if end else date.today()
+        start_date = date.fromisoformat(start) if start else None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"日期格式错误: {e}") from e
+    if start_date is None:
         # 空 start = 全部历史: 用本地最早日K日期, 查不到再回退到默认窗口
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
+    _guard_minute_strategy_backtest(request, strategy_id, start_date, asset_type)
 
     # 服务端范围保护
     guard_violated = False
@@ -800,10 +832,12 @@ async def optimize_stream(
     from app.backtest.optimizer import OptimizeConfig
     from app.backtest.worker import make_worker_task, run_worker_task
 
-    end_date = date.fromisoformat(end) if end else date.today()
-    if start:
-        start_date = date.fromisoformat(start)
-    else:
+    try:
+        end_date = date.fromisoformat(end) if end else date.today()
+        start_date = date.fromisoformat(start) if start else None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"日期格式错误: {e}") from e
+    if start_date is None:
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=FACTOR_DEFAULT_DAYS))
 
@@ -1022,10 +1056,12 @@ async def walkforward_stream(
 
     direction = direction or None
 
-    end_date = date.fromisoformat(end) if end else date.today()
-    if start:
-        start_date = date.fromisoformat(start)
-    else:
+    try:
+        end_date = date.fromisoformat(end) if end else date.today()
+        start_date = date.fromisoformat(start) if start else None
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"日期格式错误: {e}") from e
+    if start_date is None:
         earliest = request.app.state.repo.earliest_daily_date()
         start_date = earliest or (end_date - timedelta(days=STRATEGY_DEFAULT_DAYS))
 

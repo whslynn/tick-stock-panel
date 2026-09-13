@@ -32,7 +32,8 @@ _CAPSET_CACHE_FILE = "capabilities.json"
 # v2: 拆分 depth5 → depth5(单只) + depth5.batch(批量)
 # v3: 探测补全 quote.batch(此前 tiers.yaml 声明了但 _probe_real 漏探测)
 # v5: Free 档补充付费服务器 quote.by_symbol(10rpm/5标的),用于自选股实时监控。
-_CACHE_SCHEMA_VERSION = 5
+# v6: 新增 intraday.universe(全量分钟) 探测。
+_CACHE_SCHEMA_VERSION = 6
 
 # 探测用最小代价请求:挑流通性最好的 1 只标的试
 _PROBE_SYMBOL = "600000.SH"  # 浦发银行,长期不会退市
@@ -234,6 +235,11 @@ def _probe_real(tiers: dict) -> tuple[CapabilitySet, list[str], set[Cap]]:
              lambda: tf.klines.intraday_batch([_PROBE_SYMBOL], count=1, as_dataframe=False),
              defaults(Cap.INTRADAY_BATCH))
 
+    # intraday.universe — 全量分钟: 标的池单请求拉全市场最新 N 根 (Expert)
+    try_call(Cap.INTRADAY_UNIVERSE,
+             lambda: tf.klines.intraday_universe("CN_Equity_A", count=1, as_dataframe=False),
+             defaults(Cap.INTRADAY_UNIVERSE))
+
     # depth5 — 按标的查(单只)
     try_call(Cap.DEPTH5,
              lambda: tf.depth.get(_PROBE_SYMBOL),
@@ -299,12 +305,14 @@ def detect_capabilities(force: bool = False) -> CapabilitySet:
 
 # 数据集 → 能力映射: 第三方源声明某数据集且被选为当前 provider 时补授的能力。
 # 实时行情无对应能力键 (权限由 QuoteService.is_realtime_allowed 判定);
-# 五档盘口/WebSocket 暂无第三方数据集契约, 不增广。
+# WebSocket 暂无第三方数据集契约, 不增广。
 _DATASET_CAP_MAP: tuple[tuple[str, Cap], ...] = (
     ("daily", Cap.KLINE_DAILY_BATCH),
     ("adj_factor", Cap.ADJ_FACTOR),
     ("minute", Cap.KLINE_MINUTE_BATCH),
+    ("depth5", Cap.DEPTH5_BATCH),
     ("financial", Cap.FINANCIAL),
+    ("full_minute", Cap.INTRADAY_UNIVERSE),
 )
 
 
@@ -316,13 +324,13 @@ def _augment_custom_sources(capset: CapabilitySet) -> None:
 
         daily_provider = preferences.get_daily_data_provider()
         adj_provider = preferences.get_adj_factor_provider()
-        if adj_provider == "same_as_daily":
-            adj_provider = daily_provider
         active_providers = {
             "daily": daily_provider,
             "adj_factor": adj_provider,
             "minute": preferences.get_minute_data_provider(),
+            "depth5": preferences.get_depth5_data_provider(),
             "financial": preferences.get_financial_provider(),
+            "full_minute": preferences.get_full_minute_data_provider(),
         }
         for dataset, cap in _DATASET_CAP_MAP:
             provider = active_providers[dataset]
@@ -466,6 +474,7 @@ _CAP_ALIASES: dict[Cap, str] = {
     Cap.KLINE_MINUTE_BY_SYMBOL: "分钟K",
     Cap.INTRADAY: "分时",
     Cap.INTRADAY_BATCH: "批量分时",
+    Cap.INTRADAY_UNIVERSE: "全量分钟",
     Cap.DEPTH5: "五档",
     Cap.DEPTH5_BATCH: "批量五档",
     Cap.WEBSOCKET: "WS",
@@ -541,8 +550,6 @@ def _compute_label_and_missing(
 
     base_caps = _tier_caps_set(tiers, base)
     missing = sorted(c.value for c in (base_caps - held))
-    extras = base_caps and (held - base_caps) or set()  # extras 是超出该档的部分
-
     # 实际超出 = held 中"既不属于本档、也不属于本档下方任何档"的 cap
     # 简化:extras = held - base_caps
     extras_set = held - base_caps

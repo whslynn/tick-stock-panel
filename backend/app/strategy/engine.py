@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 
+from app.config import settings
 from app.strategy.scoring import (
     SCORING_DIRECTION_LOW,
     effective_scoring,
@@ -155,6 +157,9 @@ class StrategyDataContext:
     as_of: date
     current: pl.DataFrame | None = None
     history: pl.DataFrame | None = None
+    # 仅 1m 分支: 策略声明 META["daily_history_bars"] 时注入的日线 enriched 窗口,
+    # 供分钟策略叠加日线维度条件 (如 N 日内涨停过); 未声明时为 None。
+    daily_history: pl.DataFrame | None = None
     market: Any | None = None
     cache_key: str | None = None
 
@@ -199,6 +204,11 @@ class StrategyDef:
     execution_backend: str = "polars_expr"
     matrix_strategy: Any | None = None
     composite: CompositeSpec | None = None  # 仅 backend=="composite" 时非空
+    # 仅 backend=="minute_filter" 时非空: 输入为当日分钟K窗口, 输出为命中标的行
+    filter_minute_history_fn: Callable[[pl.DataFrame, dict], pl.DataFrame] | None = None
+    # 仅 minute_filter: META["daily_history_bars"] 声明需要的日线历史窗口 (0=不需要;
+    # >0 时 filter_minute_history 必须接受 daily 关键字, 引擎注入 context.daily_history)
+    minute_daily_bars: int = 0
 
 
 @dataclass
@@ -471,6 +481,7 @@ class StrategyEngine:
 
         filter_fn = getattr(mod, "filter", None)
         filter_history_fn = getattr(mod, "filter_history", None)
+        filter_minute_history_fn = getattr(mod, "filter_minute_history", None)
         execution_backend = str(
             getattr(
                 mod,
@@ -481,7 +492,7 @@ class StrategyEngine:
                 ),
             )
         )
-        valid_backends = {"polars_expr", "matrix_native", "python_history_legacy", "composite"}
+        valid_backends = {"polars_expr", "matrix_native", "python_history_legacy", "composite", "minute_filter"}
         if execution_backend not in valid_backends:
             raise ValueError(
                 f"unsupported execution backend {execution_backend!r}; "
@@ -490,6 +501,7 @@ class StrategyEngine:
 
         matrix_strategy = getattr(mod, "MATRIX_STRATEGY", None)
         composite_spec: CompositeSpec | None = None
+        minute_daily_bars = 0
         if execution_backend == "matrix_native":
             from app.backtest.matrix import MatrixStrategy
 
@@ -515,6 +527,39 @@ class StrategyEngine:
                     "composite strategy must not declare filter, filter_history or MATRIX_STRATEGY"
                 )
             composite_spec = _parse_composite_children(meta.get("children"))
+        elif execution_backend == "minute_filter":
+            # 分钟形态策略: 只声明 filter_minute_history; 数据源是本地当日分钟K分区
+            # (由 ScreenerService.build_strategy_context 的 1m 分支注入), 因此 timeframes
+            # 必须且只能是 ["1m"] — 混入 1d 会让日线 context 走错数据路径。
+            if (
+                filter_minute_history_fn is None
+                or filter_fn is not None
+                or filter_history_fn is not None
+                or matrix_strategy is not None
+            ):
+                raise ValueError(
+                    "minute_filter strategy must declare only filter_minute_history"
+                )
+            if meta.get("timeframes") != ["1m"]:
+                raise ValueError(
+                    "minute_filter strategy must declare timeframes == ['1m']"
+                )
+            # 可选日线历史窗口: 声明 daily_history_bars 时 fn 必须接受 daily 关键字,
+            # 引擎会把 context.daily_history (enriched 日线窗口) 注入进来。
+            minute_daily_bars = int(meta.get("daily_history_bars") or 0)
+            if minute_daily_bars < 0 or minute_daily_bars > 250:
+                raise ValueError(
+                    "minute_filter daily_history_bars must be within [0, 250]"
+                )
+            if minute_daily_bars > 0:
+                import inspect
+
+                sig = inspect.signature(filter_minute_history_fn)
+                if "daily" not in sig.parameters:
+                    raise ValueError(
+                        "minute_filter daily_history_bars requires "
+                        "filter_minute_history to accept a 'daily' keyword"
+                    )
         elif filter_history_fn is None or filter_fn is not None:
             raise ValueError("python_history_legacy strategy must declare only filter_history")
 
@@ -538,6 +583,8 @@ class StrategyEngine:
             execution_backend=execution_backend,
             matrix_strategy=matrix_strategy,
             composite=composite_spec,
+            filter_minute_history_fn=filter_minute_history_fn,
+            minute_daily_bars=minute_daily_bars,
         )
 
     def reload(self) -> None:
@@ -651,6 +698,16 @@ class StrategyEngine:
         if value in (None, 0):
             return None
         return max(0, int(value))
+
+    def minute_daily_history_bars(self, strategy_ids: list[str]) -> int:
+        """1m 分支需要的日线 enriched 窗口大小: 各 minute_filter 策略声明的
+        META["daily_history_bars"] 取 max, 未声明 (纯分钟策略) 为 0。"""
+        required = 0
+        for strategy_id in strategy_ids:
+            strategy = self.get(strategy_id)
+            if strategy.execution_backend == "minute_filter":
+                required = max(required, strategy.minute_daily_bars)
+        return required
 
     def required_history_bars(
         self,
@@ -885,7 +942,39 @@ class StrategyEngine:
         exit_signal_hits = self._collect_signal_hits(signal_df, exit_signals)
 
         # 普通策略只读目标日期；历史策略读取调用方注入的历史窗口。
-        if s.filter_history_fn:
+        if s.execution_backend == "minute_filter":
+            # 分钟策略: 读取调用方注入的当日分钟K窗口。无 date 列, 不按 as_of 过滤,
+            # 每个命中行自带最后K线时间戳 (last_datetime)。
+            if history is None:
+                raise ValueError(f"strategy {strategy_id} requires minute history data")
+            if history.is_empty():
+                return StrategyResult(
+                    as_of=as_of,
+                    strategy_id=strategy_id,
+                    exit_signal_hits=exit_signal_hits,
+                )
+            # 盘中信号列注入(csgi_): 实盘扫描与分钟回测共用本路径 — 与监控评估
+            # 同一特征构造器, 单点注入保证三处口径一致。
+            history = self._inject_intraday_signal_columns(history)
+            missing_csgi = [
+                name for name in s.required_features
+                if name.startswith("csgi_") and name not in history.columns
+            ]
+            if missing_csgi:
+                raise ValueError(
+                    "策略引用了未定义的盘中信号: "
+                    + ", ".join(sorted(missing_csgi))
+                    + " — 请先在「自定义信号」中创建(timeframe=intraday)后再运行"
+                )
+            if s.minute_daily_bars > 0:
+                df = s.filter_minute_history_fn(history, params, daily=context.daily_history)
+            else:
+                df = s.filter_minute_history_fn(history, params)
+            # 基础过滤/展示列 (name/total_shares/change_pct 等) 来自 enriched 快照,
+            # 在命中结果上事后联表, 避免把 enriched 列铺到全市场分钟行上。
+            if current is not None and not current.is_empty():
+                df = self._join_basic_columns(df, current)
+        elif s.filter_history_fn:
             if history is None:
                 raise ValueError(f"strategy {strategy_id} requires history data")
             df = history
@@ -907,6 +996,15 @@ class StrategyEngine:
                     "策略引用了未定义的自定义信号: "
                     + ", ".join(sorted(missing_csg))
                     + " — 请先在「自定义信号」管理中创建对应信号后再运行"
+                )
+            missing_csgi = [
+                name for name in s.required_features
+                if name.startswith("csgi_")
+            ]
+            if missing_csgi:
+                raise ValueError(
+                    "盘中信号仅可用于分钟策略(timeframes=['1m']), 日线策略不支持: "
+                    + ", ".join(sorted(missing_csgi))
                 )
             df = s.filter_history_fn(df, params)
             if "date" in df.columns:
@@ -945,7 +1043,9 @@ class StrategyEngine:
         # Stage 3: 评分
         df = self._apply_scoring(df, scoring, scoring_directions)
         entry_signal_hits = self._collect_signal_hits(df, entry_signals)
-        if not entry_signals and (s.filter_history_fn or s.filter_fn):
+        if not entry_signals and (
+            s.filter_history_fn or s.filter_fn or s.execution_backend == "minute_filter"
+        ):
             entry_signal_hits = [
                 {"symbol": str(symbol), "signals": []}
                 for symbol in df["symbol"].cast(pl.Utf8).unique().to_list()
@@ -1021,8 +1121,15 @@ class StrategyEngine:
         overrides_map: dict | None = None,
         *,
         strategy_ids: list[str] | None = None,
+        parallel: bool = True,
     ) -> dict[str, StrategyResult]:
-        """批量执行策略；当前数据、历史和矩阵均来自同一个调用上下文。"""
+        """批量执行策略；当前数据、历史和矩阵均来自同一个调用上下文。
+
+        parallel=True 时用有界线程池并发执行: 策略对 context 是只读纯函数
+        (polars 计算释放 GIL), 并发不改变结果, 逐策略耗时日志不变。composite
+        子策略的递归 run_all 以 parallel=False 调用, 保证嵌套时线程总数仍
+        不超过 worker 上限, 不随叠加层数放大。
+        """
         if context.current is None:
             raise ValueError("strategy run_all context requires current data")
         df = context.current
@@ -1036,44 +1143,24 @@ class StrategyEngine:
         history_strats = [
             (sid, strategy)
             for sid, strategy in selected
-            if strategy.filter_history_fn or strategy.execution_backend == "matrix_native"
+            if strategy.filter_history_fn
+            or strategy.execution_backend in ("matrix_native", "minute_filter")
         ]
         shared_history = context.history
         if history_strats and shared_history is None:
             raise ValueError("selected strategies require history data")
 
         shared_matrix = context.market
-        matrix_strats = [
-            (sid, strategy)
-            for sid, strategy in selected
-            if strategy.execution_backend == "matrix_native"
-        ]
-        if (
-            shared_matrix is None
-            and matrix_strats
-            and shared_history is not None
-            and not shared_history.is_empty()
-        ):
-            from app.backtest.matrix import build_market_data_matrix
-
-            field_columns: set[str] = set()
-            for sid, strategy in matrix_strats:
-                field_columns.update(
-                    self._matrix_field_columns(
-                        strategy,
-                        overrides_map.get(sid),
-                        params_map.get(sid),
-                    )
-                )
-            shared_matrix = build_market_data_matrix(
-                shared_history,
-                field_columns=field_columns,
+        if shared_matrix is None:
+            shared_matrix = self.build_shared_matrix(
+                context, selected, params_map, overrides_map
             )
 
         results: dict[str, StrategyResult] = {}
 
-        for sid, _ in selected:
-            results[sid] = self.run(
+        def _execute(sid: str) -> tuple[str, StrategyResult]:
+            started = time.perf_counter()
+            result = self.run(
                 sid,
                 replace(
                     context,
@@ -1084,8 +1171,76 @@ class StrategyEngine:
                 params=params_map.get(sid),
                 overrides=overrides_map.get(sid),
             )
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            # >=1s 打 INFO 供热点归因 (哪些策略吃掉了 run_all 的大头), 其余 DEBUG 防噪。
+            log_fn = logger.info if elapsed_ms >= 1000 else logger.debug
+            log_fn(
+                "run_all: strategy %s took %.0fms (total=%d)",
+                sid,
+                elapsed_ms,
+                result.total,
+            )
+            return sid, result
+
+        workers = min(settings.strategy_run_all_workers, len(selected))
+        if parallel and workers > 1:
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="strategy-run"
+            ) as pool:
+                futures = [pool.submit(_execute, sid) for sid, _ in selected]
+                # 按原顺序收集: 首个失败策略的异常语义与串行执行一致。
+                for future in futures:
+                    sid, result = future.result()
+                    results[sid] = result
+        else:
+            for sid, _ in selected:
+                sid, result = _execute(sid)
+                results[sid] = result
 
         return results
+
+    def build_shared_matrix(
+        self,
+        context: StrategyDataContext,
+        selected: list[tuple[str, StrategyDef]],
+        params_map: dict | None = None,
+        overrides_map: dict | None = None,
+    ):
+        """按所选策略的字段并集构建市场数据矩阵; 无矩阵策略或无历史时返回 None。
+
+        渐进式 run_all (逐策略执行) 也用它一次建好并集矩阵后放入 context.market,
+        避免每个 matrix_native 策略重复构建同一份大矩阵 (全市场历史, 秒级)。
+        """
+        params_map = params_map or {}
+        overrides_map = overrides_map or {}
+        matrix_strats = [
+            (sid, strategy)
+            for sid, strategy in selected
+            if strategy.execution_backend == "matrix_native"
+        ]
+        history = context.history
+        if not matrix_strats or history is None or history.is_empty():
+            return None
+
+        from app.backtest.matrix import build_market_data_matrix
+
+        field_columns: set[str] = set()
+        for sid, strategy in matrix_strats:
+            field_columns.update(
+                self._matrix_field_columns(
+                    strategy,
+                    overrides_map.get(sid),
+                    params_map.get(sid),
+                )
+            )
+        matrix_t0 = time.perf_counter()
+        matrix = build_market_data_matrix(history, field_columns=field_columns)
+        logger.info(
+            "run_all: shared matrix built in %.0fms (fields=%d)",
+            (time.perf_counter() - matrix_t0) * 1000,
+            len(field_columns),
+        )
+        return matrix
 
     @staticmethod
     def _matrix_field_columns(
@@ -1167,6 +1322,11 @@ class StrategyEngine:
         basic_filter = dict(strategy.basic_filter or {})
         if overrides.get("basic_filter"):
             basic_filter.update(overrides["basic_filter"])
+        # 策略扫描的运行期过滤同样要按资产类型中和股票专属键 (boards/价格界),
+        # 否则 ETF 候选在矩阵掩码阶段被静默清零 (#215); 函数级导入避免
+        # engine ↔ backtest.strategy 的模块级循环依赖 (与上方 matrix 导入同模式)
+        from app.backtest.strategy import _basic_filter_for_asset
+        basic_filter = _basic_filter_for_asset(basic_filter, context.asset_type)
         scoring = effective_scoring(strategy.meta.get("scoring"), overrides)
         asset_mask = None
         if pool:
@@ -1316,6 +1476,9 @@ class StrategyEngine:
             params_map={},
             overrides_map=overrides_map,
             strategy_ids=child_ids,
+            # 嵌套调用串行: 父级 worker 已并发, 子级再开池会使线程总数随叠加
+            # 层数放大 (4×4×...), 超出并发闸与核数的合理范围。
+            parallel=False,
         )
         ordered_results = [child_results[cid] for cid in child_ids]
 
@@ -1465,6 +1628,67 @@ class StrategyEngine:
         if expr is not None:
             return df.filter(expr)
         return df
+
+    # 分钟策略命中行需要从事后联表补齐的 enriched 列: 基础过滤引用 + 前端展示。
+    # close 不在列 — 分钟策略输出的 close 是最后一根分钟K收盘价, 优先于日线快照。
+    MINUTE_JOIN_COLUMNS: tuple[str, ...] = (
+        "name", "total_shares", "float_shares", "amount",
+        "turnover_rate", "change_pct", "pre_close",
+    )
+
+    def _user_data_dir(self) -> Path | None:
+        """从策略目录推导 data_dir(…/strategies/custom → data_dir)。推不出则跳过注入。"""
+        for d in self._strategy_dirs:
+            if d.name == "custom" and d.parent.name == "strategies":
+                return d.parent.parent
+        return None
+
+    def _inject_intraday_signal_columns(self, minute_df: pl.DataFrame) -> pl.DataFrame:
+        """向当日分钟K帧注入自定义盘中信号列(csgi_, 当日条件上升沿)。
+
+        单点注入: 实盘分钟扫描与分钟回测 worker 共用本方法, 特征计算与
+        监控评估同源(intraday_features), 保证口径一致。无定义/帧为空时原样返回。
+        """
+        if minute_df is None or minute_df.is_empty() or "datetime" not in minute_df.columns:
+            return minute_df
+        data_dir = self._user_data_dir()
+        if data_dir is None:
+            return minute_df
+        try:
+            from app.strategy import custom_signals
+            from app.strategy.intraday_features import build_feature_frame
+
+            definitions = custom_signals.load_intraday_all(data_dir)
+            if not definitions:
+                return minute_df
+            exprs = custom_signals.build_intraday_expressions(definitions)
+            if not exprs:
+                return minute_df
+            frame = build_feature_frame(minute_df)
+            if frame.is_empty():
+                return minute_df
+            evaluated = custom_signals.apply_intraday_edges(frame, exprs).select(
+                ["symbol", "datetime", *exprs.keys()]
+            )
+            return minute_df.join(evaluated, on=["symbol", "datetime"], how="left").with_columns(
+                [pl.col(name).fill_null(False).cast(pl.Boolean).alias(name) for name in exprs]
+            )
+        except Exception as e:
+            # 注入失败不阻断策略执行: 未注入列会由 required_features 校验兜底报错
+            logger.warning("intraday signal inject failed: %s", e)
+            return minute_df
+
+    @staticmethod
+    def _join_basic_columns(df: pl.DataFrame, current: pl.DataFrame) -> pl.DataFrame:
+        """把 enriched 快照列按 symbol 联到分钟策略输出上, 只补 df 缺失的列。"""
+        cols = [
+            c for c in StrategyEngine.MINUTE_JOIN_COLUMNS
+            if c in current.columns and c not in df.columns
+        ]
+        if not cols:
+            return df
+        extra = current.select(["symbol", *cols]).unique(subset=["symbol"], keep="last")
+        return df.join(extra, on="symbol", how="left")
 
     # ================================================================
     # 内部: 评分
